@@ -107,14 +107,23 @@ class BallDisappearanceBuffer:
         if st["gap"] > self.max_gap_frames:
             return None
 
-        # Extrapolate
+        # Extrapolate with per-step velocity decay.
+        # Each simulated step multiplies the current velocity by `decay` before
+        # adding it — this correctly models a ball slowing under drag/gravity
+        # rather than applying a single damping factor to the total displacement
+        # (which underestimates position at small gaps and diverges at large ones).
         extrap_steps = min(st["gap"], self.max_extrap_frames)
         vx, vy = st["vel"]
         px, py = st["pos"]
-        # Dampen velocity so extrapolation doesn't shoot off wildly
-        damping = 0.85 ** extrap_steps
-        return (px + vx * extrap_steps * damping,
-                py + vy * extrap_steps * damping)
+        decay = 0.85
+        ex, ey = px, py
+        cvx, cvy = vx, vy
+        for _ in range(extrap_steps):
+            cvx *= decay
+            cvy *= decay
+            ex += cvx
+            ey += cvy
+        return (ex, ey)
 
     def is_visible(self, ball_id) -> bool:
         st = self._state.get(ball_id)
@@ -613,12 +622,25 @@ class ShotCandidateTracker:
                 cand["last_dist"] = dist
                 # Do NOT `continue` — check movement on this same frame
 
-            # --- Step-size from ball's own history (real track only) --------
+            # --- Step-size: displacement of ball from previous frame ---------
+            # When the ball is invisible the buffer provides an interpolated
+            # current position (bx, by). We must compare it against the buffer's
+            # previous interpolated position — NOT against track.history[-2],
+            # which is the last *real* frame and makes step=0 during occlusion.
             step = 0.0
-            track = ball_tracker.get_track(cand["ball_id"])
-            if track and track.get("history") and len(track["history"]) >= 2:
-                pbx, pby = track["history"][-2][:2]
-                step = math.hypot(bx - pbx, by - pby)
+            if disappearance_buffer is not None and not disappearance_buffer.is_visible(cand["ball_id"]):
+                # Ball is occluded — derive step from buffer's velocity estimate
+                vx, vy = disappearance_buffer._state.get(cand["ball_id"], {}).get("vel", (0.0, 0.0))
+                # One decay step (matches how get_position advances each frame)
+                gap = disappearance_buffer.gap_frames(cand["ball_id"])
+                decay = 0.85 ** min(gap, disappearance_buffer.max_extrap_frames)
+                step = math.hypot(vx * decay, vy * decay)
+            else:
+                # Ball is visible — use real consecutive history positions
+                track = ball_tracker.get_track(cand["ball_id"])
+                if track and track.get("history") and len(track["history"]) >= 2:
+                    pbx, pby = track["history"][-2][:2]
+                    step = math.hypot(bx - pbx, by - pby)
 
             # --- Confirmation gate -----------------------------------------
             if step >= self.away_min_px and dist >= cand["last_dist"] + self.away_min_px:
@@ -705,8 +727,8 @@ class PersonTracker:
         detections : list of (cx, cy, x1, y1, x2, y2)
         """
         if not self.tracks or not detections:
-            # Handle trivial cases without building a cost matrix
-            for i, det in enumerate(detections):
+            # Spawn tracks for any new detections (handles empty-tracks case)
+            for det in detections:
                 self.tracks.append({
                     "id": self.next_id,
                     "center": (det[0], det[1]),
@@ -714,8 +736,9 @@ class PersonTracker:
                     "missed": 0,
                 })
                 self.next_id += 1
-            for t in self.tracks:
-                if t["missed"] == 0 and not detections:
+            # When there are no detections, every existing track missed this frame
+            if not detections:
+                for t in self.tracks:
                     t["missed"] += 1
             self.tracks = [t for t in self.tracks if t["missed"] <= self.max_missed]
             return
