@@ -216,6 +216,8 @@ def ball_heading_toward(track, anchor, window_frames, angle_deg, min_disp_px):
     """Check if ball is heading toward anchor."""
     if track is None or anchor is None:
         return False
+    if not np.isfinite(anchor[0]) or not np.isfinite(anchor[1]):
+        return False
     hist = track.get("history", [])
     if len(hist) < 2:
         return False
@@ -224,15 +226,22 @@ def ball_heading_toward(track, anchor, window_frames, angle_deg, min_disp_px):
         return False
     x0, y0 = tail[0][:2]
     x1, y1 = tail[-1][:2]
+    if not np.isfinite(x0) or not np.isfinite(y0) or not np.isfinite(x1) or not np.isfinite(y1):
+        return False
     dx, dy = x1 - x0, y1 - y0
     dist = math.hypot(dx, dy)
-    if dist < min_disp_px:
+    if not np.isfinite(dist) or dist < min_disp_px:
         return False
     to_player = np.array([anchor[0] - x1, anchor[1] - y1], dtype=float)
     to_norm = np.linalg.norm(to_player)
-    if to_norm < 1e-6:
+    if not np.isfinite(to_norm) or to_norm < 1e-6:
         return False
-    dot = (dx * to_player[0] + dy * to_player[1]) / (dist * to_norm)
+    denom = dist * to_norm
+    if not np.isfinite(denom) or denom <= 1e-12:
+        return False
+    dot = (dx * to_player[0] + dy * to_player[1]) / denom
+    if not np.isfinite(dot):
+        return False
     dot = float(np.clip(dot, -1.0, 1.0))
     angle = math.degrees(math.acos(dot))
     return angle <= angle_deg and dot > 0
