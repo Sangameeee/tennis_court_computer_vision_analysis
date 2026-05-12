@@ -41,7 +41,8 @@ The system outputs a JSON file with all detected shots, including:
 
 | Tool | Purpose |
 |------|---------|
-| **YOLOv8** (Ultralytics) | Object detection for persons and balls |
+|**YOLO26x**| Object detection for persons |
+| **YOLOv8** (Ultralytics) | Object detection  balls |
 | **YOLOv8-Pose** | Skeleton/keypoint detection (body joints) |
 | **OpenCV (cv2)** | Video reading/writing, image processing, drawing |
 | **NumPy** | Numerical computations and array operations |
@@ -75,7 +76,7 @@ shots.jsonl (Detection Results)
 **How it works:**
 
 1. **Detection** - For every frame:
-   - YOLOv8 model scans the entire frame
+   - YOLOv26 model scans the entire frame
    - Identifies objects and classifies them as "person" (class ID = 0)
    - Returns bounding boxes: `(x1, y1, x2, y2)` - top-left and bottom-right corners
 
@@ -183,7 +184,7 @@ Detects when a player is swinging:
 **Serve:**
 - Wrists are far apart (> `WRIST_CLOSE_PX` pixels)
 - Player is NOT walking
-- Player is NOT moving much (static)
+- Player is static (OR has no sharp wrist movement for last 1 second)
 - Ball is stationary or slow-moving
 - Confirms serve is starting
 

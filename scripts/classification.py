@@ -325,6 +325,24 @@ class PoseHistoryTracker:
         shoulders_slow = shoulder_speed is None or shoulder_speed <= shoulder_vel_thresh
         return leg_cycle and wrists_slow and shoulders_slow
 
+    def has_no_sharp_movement(self, player_id, window_frames: int, movement_thresh: float = utils.SWING_WRIST_VEL_PX):
+        """Check if wrist movement has been below threshold for the last window_frames."""
+        hist = self.history.get(player_id)
+        if not hist or len(hist) < window_frames:
+            return False
+        recent = list(hist)[-window_frames:]
+        for i in range(1, len(recent)):
+            prev, cur = recent[i - 1], recent[i]
+            max_disp = 0.0
+            for key in ("lw", "rw"):
+                p, c = prev.get(key), cur.get(key)
+                if p is None or c is None:
+                    continue
+                max_disp = max(max_disp, math.hypot(c[0] - p[0], c[1] - p[1]))
+            if max_disp >= movement_thresh:
+                return False
+        return True
+
 
 class BallStateHelper:
     """Evaluates ball liveliness and plausibility using recent history."""
@@ -564,7 +582,14 @@ class ShotDetectionEngine:
         disp = pose_tracker.anchor_displacement(player_id, self.serve_frames)
         if disp is None:
             return False
-        return disp <= utils.PLAYER_STATIC_PX
+        
+        # Original condition: player is static
+        if disp <= utils.PLAYER_STATIC_PX:
+            return True
+        
+        # Alternative condition: no sharp wrist movement for last 1 second
+        no_sharp_movement = pose_tracker.has_no_sharp_movement(player_id, self.serve_frames)
+        return no_sharp_movement
 
     def process_frame(self, frame_idx: int, player_states: list, pose_tracker: PoseHistoryTracker, ball_tracker) -> list:
         events = []
