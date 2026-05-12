@@ -46,6 +46,7 @@ class VideoProcessor:
         utils.BALL_INTERP_CONF_MAX = c.get("BALL_INTERP_CONF_MAX", 0.01)
         utils.PLAYER_STATIC_PX = c.get("PLAYER_STATIC_PX") or max(12.0, utils.PIXELS_PER_METER * 0.1)
         utils.BALL_AWAY_EPS_PX = c.get("BALL_AWAY_EPS_PX", 1.0)
+        utils.SHOT_CONFIRM_TURN_DEG = c.get("SHOT_CONFIRM_TURN_DEG", 140.0)
         utils.SWING_WRIST_VEL_PX = c.get("SWING_WRIST_VEL_PX", 18.0)
         utils.SWING_DIR_ANGLE_DEG = c.get("SWING_DIR_ANGLE_DEG", 60.0)
         utils.BALL_NEAR_RADIUS_RATIO = c.get("BALL_NEAR_RADIUS_RATIO", 1.6)

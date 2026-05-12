@@ -413,12 +413,17 @@ class BallStateHelper:
         if track is None or not self.is_plausible(track) or self.is_static(track):
             return 0.0
         hist = track.get("history", [])
-        if len(hist) < window_frames + 1:
+        if len(hist) < 2:
             return 0.0
-        p0 = hist[-(window_frames + 1)]
-        p1 = hist[-1]
+        end_idx = len(hist) - 1
+        start_idx = max(0, end_idx - window_frames)
+        if start_idx == end_idx:
+            return 0.0
+        p0 = hist[start_idx]
+        p1 = hist[end_idx]
         dist_px = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-        secs = window_frames / float(self.fps) if self.fps > 0 else 0.0
+        delta_frames = end_idx - start_idx
+        secs = delta_frames / float(self.fps) if self.fps > 0 else 0.0
         if secs <= 0.0:
             return 0.0
         speed_px_per_sec = dist_px / secs
@@ -428,46 +433,50 @@ class BallStateHelper:
 
 
 class ShotCandidateTracker:
-    """Tracks swing events and confirms forehands once the ball moves away."""
-    def __init__(self, confirm_frames: int, away_min_px: float):
+    """Tracks swing events and confirms forehands on opposite ball movement."""
+    def __init__(self, confirm_frames: int, min_confirm_px: float):
         self.confirm_frames = confirm_frames
-        self.away_min_px = away_min_px
+        self.min_confirm_px = min_confirm_px
         self.candidates: dict = {}
 
-    def add_candidate(self, player_id, frame_idx: int, anchor, ball_id, start_dist):
-        if player_id is None or anchor is None or ball_id is None:
+    def add_candidate(self, player_id, frame_idx: int, ball_id, ref_dir):
+        if player_id is None or ball_id is None:
             return
         self.candidates[player_id] = {
             "start_frame": frame_idx,
             "expires_frame": frame_idx + self.confirm_frames,
-            "anchor": anchor,
             "ball_id": ball_id,
-            "last_dist": start_dist,
+            "ref_dir": ref_dir,
         }
 
     def drop_candidate(self, player_id):
         self.candidates.pop(player_id, None)
 
-    def update(self, frame_idx: int, ball_tracker, anchors_by_player: dict, ball_state: BallStateHelper):
+    def update(self, frame_idx: int, ball_tracker, ball_state: BallStateHelper):
         confirmed = []
         for player_id, cand in list(self.candidates.items()):
             if frame_idx > cand["expires_frame"]:
                 del self.candidates[player_id]
                 continue
-            anchor = anchors_by_player.get(player_id) or cand["anchor"]
-            if anchor is None:
-                continue
             track = ball_tracker.get_track(cand["ball_id"]) if ball_tracker is not None else None
-            if track is None or not ball_state.is_live(track):
+            if track is None:
                 continue
-            pos = ball_state.position_now(track)
-            if pos is None:
+            if track.get("is_dead") or ball_state.is_static(track) or not ball_state.is_plausible(track):
                 continue
-            dist = math.hypot(pos[0] - anchor[0], pos[1] - anchor[1])
-            if cand["last_dist"] is None:
-                cand["last_dist"] = dist
+            cur_vec = ball_state.velocity_now(track)
+            if cur_vec is None:
                 continue
-            if dist > cand["last_dist"] + self.away_min_px:
+            cur_step = math.hypot(cur_vec[0], cur_vec[1])
+            if cur_step < self.min_confirm_px:
+                continue
+
+            ref_dir = cand.get("ref_dir")
+            if ref_dir is None:
+                if cur_step >= ball_state.min_live_move_px:
+                    cand["ref_dir"] = cur_vec
+                continue
+
+            if utils.angle_between(ref_dir, cur_vec) >= utils.SHOT_CONFIRM_TURN_DEG:
                 ball_speed = ball_state.speed_over_window(track, self.confirm_frames)
                 confirmed.append({
                     "player_id": player_id,
@@ -476,8 +485,6 @@ class ShotCandidateTracker:
                     "ball_speed_ms": ball_speed,
                 })
                 del self.candidates[player_id]
-            else:
-                cand["last_dist"] = dist
         return confirmed
 
 
@@ -561,7 +568,6 @@ class ShotDetectionEngine:
 
     def process_frame(self, frame_idx: int, player_states: list, pose_tracker: PoseHistoryTracker, ball_tracker) -> list:
         events = []
-        anchors_by_player = {}
 
         for d in player_states:
             pid = d.get("player_id")
@@ -573,8 +579,6 @@ class ShotDetectionEngine:
             if not has_skeleton:
                 continue
             anchor = d.get("anchor") or pose_tracker.anchor_now(pid)
-            if anchor is not None:
-                anchors_by_player[pid] = anchor
 
             walking = d.get("walking_detected")
             if walking:
@@ -604,12 +608,14 @@ class ShotDetectionEngine:
             if wrist_dist is not None and wrist_dist >= utils.WRIST_CLOSE_PX:
                 if ball_track is not None and self.ball_state.is_live(ball_track):
                     if pid not in self.candidates.candidates:
-                        start_dist = None
-                        if anchor is not None and ball_pos is not None:
-                            start_dist = math.hypot(ball_pos[0] - anchor[0], ball_pos[1] - anchor[1])
-                        self.candidates.add_candidate(pid, frame_idx, anchor, ball_track["id"], start_dist)
+                        ref_dir = None
+                        if ball_vel is not None:
+                            bmag = math.hypot(ball_vel[0], ball_vel[1])
+                            if bmag >= self.ball_state.min_live_move_px:
+                                ref_dir = ball_vel
+                        self.candidates.add_candidate(pid, frame_idx, ball_track["id"], ref_dir)
 
-        confirmed = self.candidates.update(frame_idx, ball_tracker, anchors_by_player, self.ball_state)
+        confirmed = self.candidates.update(frame_idx, ball_tracker, self.ball_state)
         for shot in confirmed:
             events.append(self._make_event(shot["player_id"], frame_idx, shot["shot"], shot.get("ball_speed_ms", 0.0)))
 
