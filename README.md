@@ -125,6 +125,8 @@ shots.jsonl (Detection Results)
 ---
 
 ### Task 3: Pose Estimation
+For this if I sent whole frames only the first two players skeleton was detected and far away players skeleton couldnt be detected
+so from the base model I just sent the cut the full frames into boundaries of the players and sent those cut image for detections to skeleton model 
 
 **What it does:** Detects body joints (skeleton) of each player.
 
