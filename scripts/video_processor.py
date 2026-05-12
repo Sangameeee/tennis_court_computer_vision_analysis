@@ -7,7 +7,7 @@ import json
 import shutil
 from ultralytics import YOLO
 from scripts import utils, ball_detection, classification
-from scripts import detection_helper, drawing_helper, player_processor, shot_logic
+from scripts import detection_helper, drawing_helper, player_processor
 
 class VideoProcessor:
     """Orchestrates the video processing pipeline."""
@@ -31,6 +31,7 @@ class VideoProcessor:
         utils.WRIST_CLOSE_RATIO = c.get("WRIST_CLOSE_RATIO", 0.0)
         utils.WRIST_CLOSE_PX = c.get("WRIST_CLOSE_PX", 4.0)
         utils.BALL_MOVE_MIN_PX = c.get("BALL_MOVE_MIN_PX") or max(8.0, utils.PIXELS_PER_METER * 0.05)
+        utils.BALL_LIVE_MIN_PX = c.get("BALL_LIVE_MIN_PX") or max(2.0, utils.BALL_MOVE_MIN_PX * 0.25)
         utils.BALL_TOWARD_ANGLE_DEG = c.get("BALL_TOWARD_ANGLE_DEG", 35.0)
         utils.WALK_WINDOW_SEC = c.get("WALK_WINDOW_SEC", 1.0)
         utils.WALK_WRIST_VEL_PX = c.get("WALK_WRIST_VEL_PX", 4.0)
@@ -40,6 +41,13 @@ class VideoProcessor:
         utils.SHOT_CONFIRM_SEC = c.get("SHOT_CONFIRM_SEC", 0.5)
         utils.DEAD_BALL_WINDOW_SEC = c.get("DEAD_BALL_WINDOW_SEC", 1.0)
         utils.DEAD_BALL_MOVE_PX = c.get("DEAD_BALL_MOVE_PX") or max(6.0, utils.PIXELS_PER_METER * 0.03)
+        utils.BALL_MAX_TURN_DEG = c.get("BALL_MAX_TURN_DEG", 120.0)
+        utils.BALL_MAX_STEP_MULT = c.get("BALL_MAX_STEP_MULT", 3.0)
+        utils.BALL_INTERP_CONF_MAX = c.get("BALL_INTERP_CONF_MAX", 0.01)
+        utils.PLAYER_STATIC_PX = c.get("PLAYER_STATIC_PX") or max(12.0, utils.PIXELS_PER_METER * 0.1)
+        utils.BALL_AWAY_EPS_PX = c.get("BALL_AWAY_EPS_PX", 1.0)
+        utils.SWING_WRIST_VEL_PX = c.get("SWING_WRIST_VEL_PX", 18.0)
+        utils.SWING_DIR_ANGLE_DEG = c.get("SWING_DIR_ANGLE_DEG", 60.0)
         utils.BALL_NEAR_RADIUS_RATIO = c.get("BALL_NEAR_RADIUS_RATIO", 1.6)
         utils.BALL_NEAR_MIN_PX = c.get("BALL_NEAR_MIN_PX", 40.0)
         utils.BALL_AWAY_MIN_PX = c.get("BALL_AWAY_MIN_PX", 2.0)
@@ -66,18 +74,16 @@ class VideoProcessor:
                 break
         if not writer: raise IOError(f"Could not open writer for {write_video_path}")
         
-        court_axis = utils.compute_court_axis(utils.POLYGON_POINTS_FOR_DRAW_AND_TEST)
         interp_max = max(1, int(fps * utils.INTERP_MAX_SEC))
         ball_tracker = ball_detection.BallTracker(max_interpolate_frames=interp_max, dead_window_frames=max(2, int(fps * utils.DEAD_BALL_WINDOW_SEC)), dead_move_px=utils.DEAD_BALL_MOVE_PX)
         movement_tracker = classification.SkeletonMovementTracker()
-        missed_detector = classification.MissedShotDetector(fps=fps)
         person_motion_tracker = classification.PersonMotionTracker(history_len=int(fps * 1.5))
         pose_history = classification.PoseHistoryTracker(history_len=int(fps * 1.5))
-        shot_candidates = classification.ShotCandidateTracker(confirm_frames=max(1, int(fps * utils.SHOT_CONFIRM_SEC)), away_min_px=utils.BALL_AWAY_MIN_PX, min_ball_move_px=utils.BALL_MOVE_MIN_PX)
+        shot_engine = classification.ShotDetectionEngine(fps=fps)
         person_tracker = classification.PersonTracker(track_file=os.path.join(save_root, ".players.track"))
         
-        shots, last_shot_frame, last_shot_index, last_shot_second = [], {}, {}, {}
-        last_active_ball_frame, frame_idx = -9999, 0
+        shots, last_shot_frame, last_shot_index = [], {}, {}
+        frame_idx = 0
         ball_rel_frames = max(2, int(fps * utils.BALL_RELEVANCE_SEC))
         walk_frames = max(2, int(fps * utils.WALK_WINDOW_SEC))
         
@@ -95,8 +101,6 @@ class VideoProcessor:
             
             drawing_helper.draw_rackets(frame, rackets)
             ball_tracker.update(c_balls, frame_idx)
-            if ball_detection.ball_moved_recently(ball_tracker, max(2, int(fps * 0.25)), utils.BALL_MOVE_MIN_PX): last_active_ball_frame = frame_idx
-            missed_detector.update(frame_idx, ball_tracker, shots)
             person_tracker.update(p_dets)
             
             p_data = []
@@ -105,21 +109,13 @@ class VideoProcessor:
                 pid = person_tracker.lookup_id_by_center((px1 + px2) / 2.0, (py1 + py2) / 2.0)
                 p_data.append(player_processor.process_player_frame(pid, px1, py1, px2, py2, (px1+px2)/2.0, (py1+py2)/2.0, h, w, frame, orig, self.pose_model, movement_tracker, pose_history, person_motion_tracker, ball_tracker, ball_rel_frames, walk_frames))
             
-            no_play = (frame_idx - last_active_ball_frame >= int(fps * utils.SERVE_NO_BALL_SEC)) and person_motion_tracker.all_static(max(1, int(fps * utils.SERVE_NO_BALL_SEC)), utils.PLAYER_STATIC_RATIO)
-            anchors = {d["player_id"]: d["anchor"] for d in p_data if d["player_id"] is not None and d["anchor"] is not None}
-            blocked = {d["player_id"] for d in p_data if d["player_id"] is not None and d["walking_detected"]}
-            confirmed = shot_candidates.update(frame_idx, ball_tracker, anchors, blocked_players=blocked)
-            conf_by_p = {s["player_id"]: s for s in confirmed}
-            
-            for d in p_data:
-                pid = d["player_id"]
-                if d["walking_detected"]: shot_candidates.drop_candidate(pid)
-                elif d["has_skeleton"] and d["swing_detected"] and (d["ball_relevant"] or no_play) and pid is not None and pid not in shot_candidates.candidates:
-                    shot_candidates.add_candidate(pid, frame_idx, d["anchor"], d["ball_id"], d["wrists_close"], no_play, d["ball_start_dist"])
-                
-                s_info = conf_by_p.get(pid)
-                if s_info and pid is not None:
-                    shot_logic.record_shot_event(pid, frame_idx, fps, s_info, ball_tracker, shots, last_shot_frame, last_shot_index, last_shot_second, missed_detector, court_axis)
+            shot_events = shot_engine.process_frame(frame_idx, p_data, pose_history, ball_tracker)
+            for ev in shot_events:
+                shots.append(ev)
+                pid = ev.get("player_id")
+                if pid is not None:
+                    last_shot_frame[pid] = ev.get("frame", frame_idx)
+                    last_shot_index[pid] = len(shots) - 1
             
             drawing_helper.draw_player_info(frame, p_data, shots, last_shot_frame, last_shot_index, fps, frame_idx)
             drawing_helper.draw_ball_visuals(frame, ball_tracker, utils.PIXELS_PER_METER, fps)
@@ -135,5 +131,11 @@ class VideoProcessor:
         shots_path = os.path.join(save_root, "shots.jsonl")
         with open(shots_path, "w") as f:
             for s in shots:
-                f.write(json.dumps({"player_id": utils.safe_int(s.get("player_id")), "frame": utils.safe_int(s.get("frame")), "second": utils.safe_float(s.get("second")), "shot": s.get("shot"), "direction": s.get("direction"), "status": s.get("status"), "ball_speed_mps": utils.safe_float(s.get("ball_speed_mps"))}) + "\n")
+                f.write(json.dumps({
+                    "player_id": utils.safe_int(s.get("player_id")),
+                    "frame": utils.safe_int(s.get("frame")),
+                    "second": utils.safe_float(s.get("second")),
+                    "shot": s.get("shot"),
+                    "ball_speed_ms": utils.safe_float(s.get("ball_speed_ms")),
+                }) + "\n")
         print(f"Done. Saved to: {output_video_path} and {shots_path}")

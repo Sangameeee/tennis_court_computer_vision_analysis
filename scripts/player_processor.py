@@ -18,6 +18,11 @@ def process_player_frame(
     shoulder_span = None
     hip_span = None
     wrists_close = False
+    left_wrist = None
+    right_wrist = None
+    left_wrist_conf = None
+    right_wrist_conf = None
+    wrist_distance_px = None
     p_kpts = None
     p_kpts_cf = None
     
@@ -40,6 +45,8 @@ def process_player_frame(
             has_skeleton = True
             left_wrist = utils.get_keypoint(p_kpts, p_kpts_cf, 9, conf_th=0.25)
             right_wrist = utils.get_keypoint(p_kpts, p_kpts_cf, 10, conf_th=0.25)
+            left_wrist_conf = float(p_kpts_cf[9]) if p_kpts_cf is not None and len(p_kpts_cf) > 9 else None
+            right_wrist_conf = float(p_kpts_cf[10]) if p_kpts_cf is not None and len(p_kpts_cf) > 10 else None
             movement_tracker.update(player_id, left_wrist, right_wrist)
             pose_history.update(player_id, p_kpts, p_kpts_cf)
             swing_detected = movement_tracker.has_swing_now(player_id)
@@ -51,13 +58,15 @@ def process_player_frame(
             
             ref_len = shoulder_span if shoulder_span is not None else hip_span
             wrists_close = utils.wrists_close_enough(left_wrist, right_wrist, ref_len=ref_len, min_px=utils.WRIST_CLOSE_PX, ratio=utils.WRIST_CLOSE_RATIO)
+            if left_wrist is not None and right_wrist is not None:
+                wrist_distance_px = math.hypot(left_wrist[0] - right_wrist[0], left_wrist[1] - right_wrist[1])
             anchor = utils.get_player_anchor(p_kpts, p_kpts_cf)
             motion_span = shoulder_span if shoulder_span is not None else hip_span
             person_motion_tracker.update(player_id, anchor, size=motion_span)
     
     # Check ball relevance
     nearest_ball_track, nearest_ball_dist = None, None
-    ball_dir_changed, ball_relevant = False, False
+    ball_relevant = False
     if anchor is not None:
         nearest_ball_track, nearest_ball_dist = ball_detection.get_nearest_ball_any(ball_tracker, anchor[0], anchor[1])
         if nearest_ball_track is not None and nearest_ball_track.get("is_dead"):
@@ -69,21 +78,24 @@ def process_player_frame(
                 near_recent = ball_detection.ball_near_recent(nearest_ball_track, anchor, radius, ball_relevance_window_frames)
                 heading_toward = ball_detection.ball_heading_toward(nearest_ball_track, anchor, ball_relevance_window_frames, utils.BALL_TOWARD_ANGLE_DEG, utils.BALL_MOVE_MIN_PX)
                 ball_relevant = near_recent or heading_toward
-            ball_dir_changed = utils.ball_direction_changed(nearest_ball_track, angle_thresh=utils.BALL_TURN_ANGLE_DEG)
     
     walking_detected = False
     if has_skeleton and player_id is not None:
-        wrist_speed, shoulder_speed = pose_history.wrist_speed_now(player_id), pose_history.shoulder_speed_now(player_id)
-        leg_cycle = pose_history.leg_cycle_detected(player_id, window_frames=walk_window_frames, min_sign_changes=utils.WALK_LEG_SIGN_CHANGES)
-        wrists_slow = wrist_speed is not None and wrist_speed <= utils.WALK_WRIST_VEL_PX
-        shoulders_slow = shoulder_speed is None or shoulder_speed <= utils.WALK_SHOULDER_VEL_PX
-        if leg_cycle and wrists_slow and shoulders_slow and not ball_dir_changed and not swing_detected:
-            walking_detected = True
+        walking_detected = pose_history.is_walking(
+            player_id,
+            window_frames=walk_window_frames,
+            wrist_vel_thresh=utils.WALK_WRIST_VEL_PX,
+            shoulder_vel_thresh=utils.WALK_SHOULDER_VEL_PX,
+            leg_sign_changes=utils.WALK_LEG_SIGN_CHANGES,
+        )
             
     return {
         "player_id": player_id, "bbox": (x1, y1, x2, y2), "center": (player_cx, player_cy),
         "is_near_side": is_near_side, "has_skeleton": has_skeleton, "anchor": anchor,
         "swing_detected": swing_detected, "wrists_close": wrists_close, "walking_detected": walking_detected,
         "ball_relevant": ball_relevant, "ball_id": nearest_ball_track["id"] if ball_relevant and nearest_ball_track else None,
-        "ball_start_dist": nearest_ball_dist if ball_relevant else None
+        "ball_start_dist": nearest_ball_dist if ball_relevant else None,
+        "left_wrist": left_wrist, "right_wrist": right_wrist,
+        "left_wrist_conf": left_wrist_conf, "right_wrist_conf": right_wrist_conf,
+        "wrist_distance_px": wrist_distance_px
     }

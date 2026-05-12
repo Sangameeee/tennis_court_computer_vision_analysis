@@ -38,15 +38,14 @@ def draw_player_info(frame, player_data, shots, last_shot_frame, last_shot_index
         # Draw shot info
         shot_idx = last_shot_index.get(player_id)
         if shot_idx is not None:
-            shot_e = shots[shot_idx]
-            last_f = last_shot_frame.get(player_id, -9999)
-            missed_f = shot_e.get("missed_frame")
-            
-            show = (frame_idx - last_f < fps) or (shot_e["status"] == "missed" and missed_f is not None and frame_idx - missed_f < fps)
-            if show:
-                txt = f"{shot_e['shot']} {shot_e['direction']}" if shot_e['direction'] != "unknown" else shot_e['shot']
-                if shot_e["status"] == "missed": txt += " missed"
-                cv2.putText(frame, txt, (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if 0 <= shot_idx < len(shots):
+                shot_e = shots[shot_idx]
+                last_f = last_shot_frame.get(player_id, -9999)
+                show = (frame_idx - last_f < fps)
+                if show:
+                    txt = shot_e.get("shot", "")
+                    if txt:
+                        cv2.putText(frame, txt, (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
 def draw_ball_visuals(frame, ball_tracker, pixels_per_meter, fps):
     """Draw ball trails and speed/direction overlay."""

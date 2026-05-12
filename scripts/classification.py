@@ -251,93 +251,369 @@ class PoseHistoryTracker:
         changes = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
         return changes >= min_sign_changes
 
+    def latest_sample(self, player_id):
+        hist = self.history.get(player_id)
+        if not hist:
+            return None
+        return hist[-1]
+
+    def wrist_velocity_vectors(self, player_id):
+        hist = self.history.get(player_id)
+        if not hist or len(hist) < 2:
+            return None, None
+        prev, cur = hist[-2], hist[-1]
+        lw_prev, lw_cur = prev.get("lw"), cur.get("lw")
+        rw_prev, rw_cur = prev.get("rw"), cur.get("rw")
+        lw_vec = None
+        rw_vec = None
+        if lw_prev is not None and lw_cur is not None:
+            lw_vec = (lw_cur[0] - lw_prev[0], lw_cur[1] - lw_prev[1])
+        if rw_prev is not None and rw_cur is not None:
+            rw_vec = (rw_cur[0] - rw_prev[0], rw_cur[1] - rw_prev[1])
+        return lw_vec, rw_vec
+
+    def wrist_distance(self, player_id):
+        sample = self.latest_sample(player_id)
+        if not sample:
+            return None
+        lw, rw = sample.get("lw"), sample.get("rw")
+        if lw is None or rw is None:
+            return None
+        return math.hypot(lw[0] - rw[0], lw[1] - rw[1])
+
+    def anchor_now(self, player_id):
+        sample = self.latest_sample(player_id)
+        if not sample:
+            return None
+        ls, rs = sample.get("ls"), sample.get("rs")
+        if ls is not None and rs is not None:
+            return ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0)
+        lh, rh = sample.get("lh"), sample.get("rh")
+        if lh is not None and rh is not None:
+            return ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
+        return None
+
+    def anchor_displacement(self, player_id, window_frames: int):
+        hist = self.history.get(player_id)
+        if not hist or len(hist) < window_frames:
+            return None
+        recent = list(hist)[-window_frames:]
+        anchors = []
+        for sample in recent:
+            ls, rs = sample.get("ls"), sample.get("rs")
+            if ls is not None and rs is not None:
+                anchors.append(((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0))
+                continue
+            lh, rh = sample.get("lh"), sample.get("rh")
+            if lh is not None and rh is not None:
+                anchors.append(((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0))
+        if len(anchors) < 2:
+            return None
+        x0, y0 = anchors[0]
+        max_disp = 0.0
+        for ax, ay in anchors[1:]:
+            max_disp = max(max_disp, math.hypot(ax - x0, ay - y0))
+        return max_disp
+
+    def is_walking(self, player_id, window_frames: int, wrist_vel_thresh: float, shoulder_vel_thresh: float, leg_sign_changes: int):
+        wrist_speed = self.wrist_speed_now(player_id)
+        shoulder_speed = self.shoulder_speed_now(player_id)
+        leg_cycle = self.leg_cycle_detected(player_id, window_frames=window_frames, min_sign_changes=leg_sign_changes)
+        if wrist_speed is None:
+            return False
+        wrists_slow = wrist_speed <= wrist_vel_thresh
+        shoulders_slow = shoulder_speed is None or shoulder_speed <= shoulder_vel_thresh
+        return leg_cycle and wrists_slow and shoulders_slow
+
+
+class BallStateHelper:
+    """Evaluates ball liveliness and plausibility using recent history."""
+    def __init__(self, fps: float):
+        self.fps = fps
+        self.static_frames = max(2, int(fps * utils.DEAD_BALL_WINDOW_SEC))
+        self.static_radius_px = utils.DEAD_BALL_MOVE_PX
+        self.min_live_move_px = utils.BALL_LIVE_MIN_PX
+        self.max_turn_deg = utils.BALL_MAX_TURN_DEG
+        self.max_step_mult = utils.BALL_MAX_STEP_MULT
+        self.interp_conf_max = utils.BALL_INTERP_CONF_MAX
+
+    def _is_interpolated(self, pt) -> bool:
+        return len(pt) > 6 and pt[6] <= self.interp_conf_max
+
+    def is_static(self, track) -> bool:
+        if track is None:
+            return False
+        hist = track.get("history", [])
+        if len(hist) < self.static_frames:
+            return False
+        tail = hist[-self.static_frames:]
+        xs = [p[0] for p in tail]
+        ys = [p[1] for p in tail]
+        spread = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        return spread <= self.static_radius_px
+
+    def _step_sizes(self, hist, window: int = 5):
+        if len(hist) < 2:
+            return []
+        tail = hist[-(window + 1):] if len(hist) > window + 1 else hist
+        steps = []
+        for i in range(1, len(tail)):
+            steps.append(math.hypot(tail[i][0] - tail[i - 1][0], tail[i][1] - tail[i - 1][1]))
+        return steps
+
+    def is_plausible(self, track) -> bool:
+        if track is None:
+            return False
+        hist = track.get("history", [])
+        if len(hist) < 2:
+            return False
+        if len(hist) < 3:
+            return True
+        p0, p1, p2 = hist[-3], hist[-2], hist[-1]
+        v1 = (p1[0] - p0[0], p1[1] - p0[1])
+        v2 = (p2[0] - p1[0], p2[1] - p1[1])
+        if (self._is_interpolated(p1) or self._is_interpolated(p2)) and (v1 != (0.0, 0.0) and v2 != (0.0, 0.0)):
+            if utils.angle_between(v1, v2) > self.max_turn_deg:
+                return False
+        steps = self._step_sizes(hist, window=5)
+        if steps:
+            positives = [s for s in steps if s > 0.0]
+            median = float(np.median(positives)) if positives else 0.0
+            max_step = median * self.max_step_mult if median > 0.0 else self.static_radius_px * 3.0
+            if math.hypot(v2[0], v2[1]) > max_step:
+                return False
+        return True
+
+    def is_live(self, track) -> bool:
+        if track is None or track.get("is_dead"):
+            return False
+        if self.is_static(track):
+            return False
+        if not self.is_plausible(track):
+            return False
+        hist = track.get("history", [])
+        window = min(self.static_frames, len(hist))
+        return utils.track_moved_recently(track, window, self.min_live_move_px)
+
+    def position_now(self, track):
+        if track is None or not track.get("history"):
+            return None
+        return track["history"][-1][:2]
+
+    def velocity_now(self, track):
+        if track is None:
+            return None
+        hist = track.get("history", [])
+        if len(hist) < 2:
+            return None
+        p0, p1 = hist[-2], hist[-1]
+        return (p1[0] - p0[0], p1[1] - p0[1])
+
+    def speed_over_window(self, track, window_frames: int) -> float:
+        if track is None or not self.is_plausible(track) or self.is_static(track):
+            return 0.0
+        hist = track.get("history", [])
+        if len(hist) < window_frames + 1:
+            return 0.0
+        p0 = hist[-(window_frames + 1)]
+        p1 = hist[-1]
+        dist_px = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        secs = window_frames / float(self.fps) if self.fps > 0 else 0.0
+        if secs <= 0.0:
+            return 0.0
+        speed_px_per_sec = dist_px / secs
+        if utils.PIXELS_PER_METER and utils.PIXELS_PER_METER > 0:
+            return round(speed_px_per_sec / utils.PIXELS_PER_METER, 3)
+        return round(speed_px_per_sec, 3)
+
 
 class ShotCandidateTracker:
-    """Tracks swing events and confirms shots once the ball moves away."""
-    def __init__(self, confirm_frames: int, away_min_px: float, min_ball_move_px: float,
-                 max_latch_dist: float = 300.0, wrist_revalidate_conf: float = 0.5):
+    """Tracks swing events and confirms forehands once the ball moves away."""
+    def __init__(self, confirm_frames: int, away_min_px: float):
         self.confirm_frames = confirm_frames
         self.away_min_px = away_min_px
-        self.min_ball_move_px = min_ball_move_px
-        self.max_latch_dist = max_latch_dist
-        self.wrist_revalidate_conf = wrist_revalidate_conf
         self.candidates: dict = {}
 
-    def add_candidate(self, player_id, frame_idx: int, anchor, ball_id, wrists_close: bool,
-                      serve_context: bool, start_dist, lw=None, rw=None):
-        if player_id is None or anchor is None: return
+    def add_candidate(self, player_id, frame_idx: int, anchor, ball_id, start_dist):
+        if player_id is None or anchor is None or ball_id is None:
+            return
         self.candidates[player_id] = {
-            "start_frame": frame_idx, "expires_frame": frame_idx + self.confirm_frames,
-            "anchor": anchor, "ball_id": ball_id, "wrists_close": wrists_close,
-            "serve_context": serve_context, "last_dist": start_dist,
-            "lw": lw, "rw": rw, "wrist_confirmed": False,
+            "start_frame": frame_idx,
+            "expires_frame": frame_idx + self.confirm_frames,
+            "anchor": anchor,
+            "ball_id": ball_id,
+            "last_dist": start_dist,
         }
 
     def drop_candidate(self, player_id):
         self.candidates.pop(player_id, None)
 
-    def update_wrists(self, player_id, lw, rw, lw_conf: float, rw_conf: float):
-        cand = self.candidates.get(player_id)
-        if cand is None or cand["wrist_confirmed"]: return
-        if lw_conf >= self.wrist_revalidate_conf and rw_conf >= self.wrist_revalidate_conf:
-            if lw is not None and rw is not None:
-                dist = math.hypot(lw[0] - rw[0], lw[1] - rw[1])
-                cand["wrists_close"] = dist < 60.0
-                cand["wrist_confirmed"] = True
-                cand["lw"], cand["rw"] = lw, rw
-
-    def update(self, frame_idx: int, ball_tracker, anchors_by_player: dict,
-               blocked_players=None, suppressed_ball_ids: set = None,
-               disappearance_buffer: BallDisappearanceBuffer = None):
-        if suppressed_ball_ids is None: suppressed_ball_ids = set()
+    def update(self, frame_idx: int, ball_tracker, anchors_by_player: dict, ball_state: BallStateHelper):
         confirmed = []
         for player_id, cand in list(self.candidates.items()):
-            if blocked_players and player_id in blocked_players: continue
             if frame_idx > cand["expires_frame"]:
-                del self.candidates[player_id]; continue
+                del self.candidates[player_id]
+                continue
             anchor = anchors_by_player.get(player_id) or cand["anchor"]
-            if anchor is None: continue
-
-            if cand["ball_id"] is None or cand["ball_id"] in suppressed_ball_ids:
-                nearest_track, nearest_dist = ball_detection.get_nearest_ball_any(ball_tracker, anchor[0], anchor[1])
-                if (nearest_track is not None and nearest_dist < self.max_latch_dist
-                        and nearest_track["id"] not in suppressed_ball_ids):
-                    cand["ball_id"] = nearest_track["id"]
-                else:
-                    continue
-
-            pos = None
-            if disappearance_buffer is not None:
-                pos = disappearance_buffer.get_position(cand["ball_id"])
+            if anchor is None:
+                continue
+            track = ball_tracker.get_track(cand["ball_id"]) if ball_tracker is not None else None
+            if track is None or not ball_state.is_live(track):
+                continue
+            pos = ball_state.position_now(track)
             if pos is None:
-                track = ball_tracker.get_track(cand["ball_id"])
-                if track is None or not track.get("history") or track.get("is_dead"): continue
-                pos = track["history"][-1][:2]
-
-            bx, by = pos
-            dist = math.hypot(bx - anchor[0], by - anchor[1])
+                continue
+            dist = math.hypot(pos[0] - anchor[0], pos[1] - anchor[1])
             if cand["last_dist"] is None:
                 cand["last_dist"] = dist
-
-            step = 0.0
-            if disappearance_buffer is not None and not disappearance_buffer.is_visible(cand["ball_id"]):
-                vx, vy = disappearance_buffer._state.get(cand["ball_id"], {}).get("vel", (0.0, 0.0))
-                gap = disappearance_buffer.gap_frames(cand["ball_id"])
-                decay = 0.85 ** min(gap, disappearance_buffer.max_extrap_frames)
-                step = math.hypot(vx * decay, vy * decay)
-            else:
-                track = ball_tracker.get_track(cand["ball_id"])
-                if track and track.get("history") and len(track["history"]) >= 2:
-                    pbx, pby = track["history"][-2][:2]
-                    step = math.hypot(bx - pbx, by - pby)
-
-            if step >= self.away_min_px and dist >= cand["last_dist"] + self.away_min_px:
-                shot_label = "serve" if cand["serve_context"] else ("backhand" if cand["wrists_close"] else "forehand")
-                confirmed.append({"player_id": player_id, "shot": shot_label, "ball_id": cand["ball_id"]})
+                continue
+            if dist > cand["last_dist"] + self.away_min_px:
+                ball_speed = ball_state.speed_over_window(track, self.confirm_frames)
+                confirmed.append({
+                    "player_id": player_id,
+                    "shot": "forehand",
+                    "ball_id": cand["ball_id"],
+                    "ball_speed_ms": ball_speed,
+                })
                 del self.candidates[player_id]
             else:
                 cand["last_dist"] = dist
         return confirmed
+
+
+class ShotDetectionEngine:
+    """Applies skeleton + ball-only shot rules and produces JSONL-ready events."""
+    def __init__(self, fps: float):
+        self.fps = fps
+        self.confirm_frames = max(1, int(fps * utils.SHOT_CONFIRM_SEC))
+        self.walk_frames = max(2, int(fps * utils.WALK_WINDOW_SEC))
+        self.serve_frames = max(2, int(fps * 1.0))
+        self.ball_state = BallStateHelper(fps)
+        self.candidates = ShotCandidateTracker(self.confirm_frames, utils.BALL_AWAY_EPS_PX)
+
+    def _make_event(self, player_id: int, frame_idx: int, shot: str, ball_speed_ms: float) -> dict:
+        return {
+            "player_id": int(player_id),
+            "frame": int(frame_idx),
+            "second": round(frame_idx / float(self.fps), 3) if self.fps else 0.0,
+            "shot": shot,
+            "ball_speed_ms": float(ball_speed_ms),
+        }
+
+    def _dominant_wrist(self, pose_tracker: PoseHistoryTracker, player_id):
+        lw_vec, rw_vec = pose_tracker.wrist_velocity_vectors(player_id)
+        sample = pose_tracker.latest_sample(player_id)
+        if sample is None:
+            return None, None, None
+        lw = sample.get("lw")
+        rw = sample.get("rw")
+        lw_speed = math.hypot(lw_vec[0], lw_vec[1]) if lw_vec is not None else 0.0
+        rw_speed = math.hypot(rw_vec[0], rw_vec[1]) if rw_vec is not None else 0.0
+        if rw_speed >= lw_speed:
+            return rw, rw_vec, rw_speed
+        return lw, lw_vec, lw_speed
+
+    def _swing_cue(self, pose_tracker: PoseHistoryTracker, player_id: int, ball_pos, ball_vel) -> bool:
+        wrist_pos, wrist_vec, wrist_speed = self._dominant_wrist(pose_tracker, player_id)
+        if wrist_pos is None or wrist_vec is None:
+            return False
+        if wrist_speed < utils.SWING_WRIST_VEL_PX:
+            return False
+        if ball_pos is None:
+            return False
+        expected = None
+        if ball_vel is not None:
+            bmag = math.hypot(ball_vel[0], ball_vel[1])
+            if bmag >= self.ball_state.min_live_move_px:
+                expected = ball_vel
+        if expected is None:
+            expected = (ball_pos[0] - wrist_pos[0], ball_pos[1] - wrist_pos[1])
+        if expected == (0.0, 0.0):
+            return False
+        angle = utils.angle_between(wrist_vec, expected)
+        return angle <= utils.SWING_DIR_ANGLE_DEG
+
+    def _nearest_ball(self, ball_tracker, anchor):
+        if ball_tracker is None or anchor is None:
+            return None
+        best = None
+        best_d = float("inf")
+        for t in getattr(ball_tracker, "tracks", []):
+            if not t.get("history"):
+                continue
+            if not self.ball_state.is_plausible(t):
+                continue
+            bx, by = t["history"][-1][:2]
+            d = math.hypot(bx - anchor[0], by - anchor[1])
+            if d < best_d:
+                best, best_d = t, d
+        return best
+
+    def _serve_ready(self, player_id: int, pose_tracker: PoseHistoryTracker, ball_track) -> bool:
+        if ball_track is None:
+            return False
+        if not (self.ball_state.is_static(ball_track) or not self.ball_state.is_live(ball_track)):
+            return False
+        disp = pose_tracker.anchor_displacement(player_id, self.serve_frames)
+        if disp is None:
+            return False
+        return disp <= utils.PLAYER_STATIC_PX
+
+    def process_frame(self, frame_idx: int, player_states: list, pose_tracker: PoseHistoryTracker, ball_tracker) -> list:
+        events = []
+        anchors_by_player = {}
+
+        for d in player_states:
+            pid = d.get("player_id")
+            if pid is None:
+                continue
+            left_wrist = d.get("left_wrist")
+            right_wrist = d.get("right_wrist")
+            has_skeleton = left_wrist is not None and right_wrist is not None
+            if not has_skeleton:
+                continue
+            anchor = d.get("anchor") or pose_tracker.anchor_now(pid)
+            if anchor is not None:
+                anchors_by_player[pid] = anchor
+
+            walking = d.get("walking_detected")
+            if walking:
+                self.candidates.drop_candidate(pid)
+                continue
+
+            ball_track = self._nearest_ball(ball_tracker, anchor)
+            ball_pos = self.ball_state.position_now(ball_track) if ball_track else None
+            ball_vel = self.ball_state.velocity_now(ball_track) if ball_track else None
+
+            if not self._swing_cue(pose_tracker, pid, ball_pos, ball_vel):
+                continue
+
+            wrist_dist = pose_tracker.wrist_distance(pid)
+            if wrist_dist is not None and wrist_dist < utils.WRIST_CLOSE_PX:
+                ball_speed = self.ball_state.speed_over_window(ball_track, self.confirm_frames) if ball_track else 0.0
+                events.append(self._make_event(pid, frame_idx, "backhand", ball_speed))
+                self.candidates.drop_candidate(pid)
+                continue
+
+            if wrist_dist is not None and wrist_dist >= utils.WRIST_CLOSE_PX and self._serve_ready(pid, pose_tracker, ball_track):
+                ball_speed = self.ball_state.speed_over_window(ball_track, self.confirm_frames) if ball_track else 0.0
+                events.append(self._make_event(pid, frame_idx, "serve", ball_speed))
+                self.candidates.drop_candidate(pid)
+                continue
+
+            if wrist_dist is not None and wrist_dist >= utils.WRIST_CLOSE_PX:
+                if ball_track is not None and self.ball_state.is_live(ball_track):
+                    if pid not in self.candidates.candidates:
+                        start_dist = None
+                        if anchor is not None and ball_pos is not None:
+                            start_dist = math.hypot(ball_pos[0] - anchor[0], ball_pos[1] - anchor[1])
+                        self.candidates.add_candidate(pid, frame_idx, anchor, ball_track["id"], start_dist)
+
+        confirmed = self.candidates.update(frame_idx, ball_tracker, anchors_by_player, self.ball_state)
+        for shot in confirmed:
+            events.append(self._make_event(shot["player_id"], frame_idx, shot["shot"], shot.get("ball_speed_ms", 0.0)))
+
+        return events
 
 
 class PersonTracker:
@@ -455,211 +731,6 @@ class PersonMotionTracker:
         return all(self.is_static(pid, window_frames, move_ratio=move_ratio) for pid in self.history)
 
 
-class MissedShotDetector:
-    """Marks a shot as missed if the ball direction does not change within a timeout."""
-    def __init__(self, fps: float, timeout_sec: float = 2.0, angle_thresh: float = 20.0, max_gap_frames: int = 15):
-        self.pending: list = []
-        self.fps = fps
-        self.timeout_frames = int(fps * timeout_sec)
-        self.angle_thresh = angle_thresh
-        self.max_gap_frames = max_gap_frames
-
-    def register_shot(self, shot_index: int, frame_idx: int, ball_id, initial_dir):
-        if ball_id is None or initial_dir is None: return
-        self.pending.append({"shot_index": shot_index, "frame_idx": frame_idx, "ball_id": ball_id,
-                             "initial_dir": initial_dir, "last_dir": initial_dir, "invisible_frames": 0})
-
-    def update_shot(self, shot_index: int, frame_idx: int, ball_id, initial_dir):
-        if ball_id is None or initial_dir is None: return
-        for p in self.pending:
-            if p["shot_index"] == shot_index:
-                p["ball_id"] = ball_id; p["last_dir"] = initial_dir; p["frame_idx"] = frame_idx; return
-        self.register_shot(shot_index, frame_idx, ball_id, initial_dir)
-
-    def update(self, frame_idx: int, ball_tracker, shots: list):
-        remaining = []
-        for p in self.pending:
-            if frame_idx - p["frame_idx"] >= self.timeout_frames:
-                shots[p["shot_index"]]["status"] = "missed"; shots[p["shot_index"]]["missed_frame"] = frame_idx; continue
-            track = ball_tracker.get_track(p["ball_id"])
-            current_dir = utils.compute_ball_direction(track)
-            if current_dir is None:
-                p["invisible_frames"] = p.get("invisible_frames", 0) + 1
-                if p["invisible_frames"] >= self.max_gap_frames:
-                    shots[p["shot_index"]]["status"] = "missed"; shots[p["shot_index"]]["missed_frame"] = frame_idx; continue
-                remaining.append(p); continue
-            p["invisible_frames"] = 0
-            angle = utils.angle_between(p["last_dir"], current_dir)
-            if angle >= self.angle_thresh: continue
-            p["last_dir"] = current_dir
-            remaining.append(p)
-        self.pending = remaining
-
-
-# ===========================================================================
-# NEW: ServeDetectionTracker (Priority Feature)
-# ===========================================================================
-
-class ServeDetectionTracker:
-    """
-    Implements robust serve preparation & execution detection.
-    
-    State Machine per potential server:
-      IDLE -> PREP -> READY -> EXECUTED -> IDLE
-      
-    Criteria:
-      1. All players static for >= static_window_sec
-      2. Ball stays within personal boundary (shoulder/torso center) for >= toss_window_sec
-      3. Tolerates brief ball exits (toss & catch, detection jitter)
-      4. Blocks large horizontal displacement away from server during prep
-      5. READY state triggers when 1 & 2 are satisfied
-      6. EXECUTED triggers on sharp wrist swing -> feeds ShotCandidateTracker
-    """
-    def __init__(self, fps: float, static_window_sec: float = 1.0, toss_window_sec: float = 1.2,
-                 boundary_radius_px: float = 180.0, max_exit_frames: int = 8,
-                 prep_timeout_sec: float = 4.0, horizontal_drift_thresh_px: float = 40.0):
-        self.fps = fps
-        self.static_frames = int(fps * static_window_sec)
-        self.toss_frames = int(fps * toss_window_sec)
-        self.boundary_radius = boundary_radius_px
-        self.max_exit_frames = max_exit_frames
-        self.timeout_frames = int(fps * prep_timeout_sec)
-        self.drift_thresh = horizontal_drift_thresh_px
-
-        # State tracking
-        self.server_id: Optional[int] = None
-        self.state: str = "IDLE"  # IDLE, PREP, READY, EXECUTED
-        self.prep_start_frame: Optional[int] = None
-        self.ready_frame: Optional[int] = None
-        self.toss_inside_count: int = 0
-        self.toss_exit_count: int = 0
-        self.boundary_center: Optional[Tuple[float, float]] = None
-        self.ball_x_history: deque = deque(maxlen=int(fps * 0.5))  # For drift check
-
-    def _get_torso_center(self, pose_tracker: PoseHistoryTracker, pid: int) -> Optional[Tuple[float, float]]:
-        """Returns shoulder midpoint, fallback to hip midpoint."""
-        hist = pose_tracker.history.get(pid)
-        if not hist: return None
-        sample = hist[-1]
-        ls, rs = sample.get("ls"), sample.get("rs")
-        if ls and rs:
-            return ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0)
-        lh, rh = sample.get("lh"), sample.get("rh")
-        if lh and rh:
-            return ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
-        return None
-
-    def reset(self):
-        self.server_id = None
-        self.state = "IDLE"
-        self.prep_start_frame = None
-        self.ready_frame = None
-        self.toss_inside_count = 0
-        self.toss_exit_count = 0
-        self.boundary_center = None
-        self.ball_x_history.clear()
-
-    def update(self, frame_idx: int, person_motion: PersonMotionTracker,
-               pose_tracker: PoseHistoryTracker, ball_buffer: BallDisappearanceBuffer,
-               ball_tracker, active_player_ids: List[int]) -> Dict[str, Any]:
-        """
-        Returns dict with:
-          - "state": current serve state
-          - "server_id": active server or None
-          - "trigger_execute": True when swing detected in READY state
-          - "boundary_center": (x,y) of server's personal zone
-        """
-        result = {"state": self.state, "server_id": self.server_id, 
-                  "trigger_execute": False, "boundary_center": self.boundary_center}
-
-        # 1. Global static check
-        all_static = person_motion.all_static(self.static_frames)
-
-        # 2. Get best ball position (visible or interpolated)
-        ball_pos = None
-        ball_id = None
-        for bid in ball_buffer._state:
-            pos = ball_buffer.get_position(bid)
-            if pos:
-                ball_pos = pos
-                ball_id = bid
-                break
-
-        # 3. State Machine Transitions
-        if self.state == "IDLE":
-            if all_static and ball_pos:
-                # Find player closest to ball as potential server
-                best_pid, best_dist = None, float("inf")
-                for pid in active_player_ids:
-                    center = self._get_torso_center(pose_tracker, pid)
-                    if center:
-                        d = math.hypot(ball_pos[0] - center[0], ball_pos[1] - center[1])
-                        if d < best_dist:
-                            best_dist, best_pid = d, pid
-                if best_pid and best_dist < self.boundary_radius * 1.5:
-                    self.server_id = best_pid
-                    self.state = "PREP"
-                    self.prep_start_frame = frame_idx
-                    self.boundary_center = self._get_torso_center(pose_tracker, best_pid)
-                    self.toss_inside_count = 0
-                    self.toss_exit_count = 0
-                    self.ball_x_history.clear()
-
-        elif self.state in ("PREP", "READY"):
-            # Timeout guard
-            if self.prep_start_frame and (frame_idx - self.prep_start_frame) > self.timeout_frames:
-                self.reset()
-                return result
-
-            # Update boundary center dynamically (follows torso)
-            if self.server_id:
-                self.boundary_center = self._get_torso_center(pose_tracker, self.server_id)
-
-            if self.boundary_center and ball_pos:
-                dist = math.hypot(ball_pos[0] - self.boundary_center[0], ball_pos[1] - self.boundary_center[1])
-                
-                # Track horizontal drift to catch early serves/throws
-                self.ball_x_history.append(ball_pos[0])
-                if len(self.ball_x_history) >= 2:
-                    x_drift = abs(self.ball_x_history[-1] - self.ball_x_history[0])
-                    if x_drift > self.drift_thresh and dist > self.boundary_radius * 0.8:
-                        self.reset()
-                        return result
-
-                # Toss boundary logic with exit tolerance
-                if dist <= self.boundary_radius:
-                    self.toss_inside_count += 1
-                    self.toss_exit_count = max(0, self.toss_exit_count - 1)  # Decay exits on re-entry
-                else:
-                    self.toss_exit_count += 1
-                    if self.toss_exit_count > self.max_exit_frames:
-                        self.reset()
-                        return result
-
-                # Transition PREP -> READY
-                if self.state == "PREP" and self.toss_inside_count >= self.toss_frames:
-                    self.state = "READY"
-                    self.ready_frame = frame_idx
-
-                # If players start moving significantly during READY, abort
-                if self.state == "READY" and not all_static:
-                    if self.ready_frame and (frame_idx - self.ready_frame) > int(self.fps * 0.5):
-                        self.reset()
-                        return result
-
-        result["state"] = self.state
-        result["server_id"] = self.server_id
-        result["boundary_center"] = self.boundary_center
-        return result
-
-    def check_execution_trigger(self, skeleton_tracker: SkeletonMovementTracker, frame_idx: int) -> bool:
-        """Call when state == READY. Returns True if sharp wrist swing detected."""
-        if self.state != "READY" or self.server_id is None:
-            return False
-        if skeleton_tracker.has_swing_recent(self.server_id, window=3):
-            self.state = "EXECUTED"
-            return True
-        return False
 
 
 # ===========================================================================
@@ -676,28 +747,9 @@ class RacketSportsPipeline:
         self.frame_w = frame_w
         self.frame_h = frame_h
 
-        # Initialize all trackers
         self.person_tracker = PersonTracker(max_missed=int(fps * 1.0), max_dist=150.0)
-        self.person_motion = PersonMotionTracker(history_len=int(fps * 1.5))
         self.pose_tracker = PoseHistoryTracker(history_len=int(fps * 1.0))
-        self.skeleton_tracker = SkeletonMovementTracker(movement_thresh=18.0, history_len=5)
-        
-        self.ball_buffer = BallDisappearanceBuffer(max_gap_frames=int(fps * 0.4), max_extrap_frames=int(fps * 0.2))
-        self.ghost_filter = GhostBallFilter(frame_w=frame_w, frame_h=frame_h)
-        
-        # 0.5 second validation window as requested
-        confirm_frames = int(fps * 0.5)
-        self.shot_tracker = ShotCandidateTracker(
-            confirm_frames=confirm_frames, away_min_px=12.0, min_ball_move_px=8.0, max_latch_dist=350.0
-        )
-        
-        self.serve_tracker = ServeDetectionTracker(
-            fps=fps, static_window_sec=1.0, toss_window_sec=1.2, 
-            boundary_radius_px=180.0, max_exit_frames=8, prep_timeout_sec=4.0
-        )
-        
-        self.missed_detector = MissedShotDetector(fps=fps, timeout_sec=2.0, angle_thresh=20.0)
-        
+        self.shot_engine = ShotDetectionEngine(fps=fps)
         self.frame_idx = 0
         self.shots_log = []
 
@@ -713,105 +765,39 @@ class RacketSportsPipeline:
             Dict with confirmed shots, serve state, and debug metadata
         """
         self.frame_idx = frame_idx
-        output = {"confirmed_shots": [], "serve_state": "IDLE", "server_id": None, "debug": {}}
+        output = {"confirmed_shots": [], "serve_state": None, "server_id": None, "debug": {}}
 
-        # 1. Update Person & Motion Trackers
         self.person_tracker.update(person_detections)
-        active_pids = [t["id"] for t in self.person_tracker.tracks]
-        
-        for t in self.person_tracker.tracks:
-            pid = t["id"]
-            cx, cy = t["center"]
-            w = t["bbox"][2] - t["bbox"][0]
-            self.person_motion.update(pid, (cx, cy), size=w)
 
-        # 2. Update Pose & Skeleton Trackers
         for pid, pdata in pose_data.items():
             kpts_xy = pdata.get("kpts_xy")
             kpts_conf = pdata.get("kpts_conf")
             self.pose_tracker.update(pid, kpts_xy, kpts_conf)
-            
-            lw = self.pose_tracker.history[pid][-1].get("lw") if pid in self.pose_tracker.history else None
-            rw = self.pose_tracker.history[pid][-1].get("rw") if pid in self.pose_tracker.history else None
-            self.skeleton_tracker.update(pid, lw, rw)
 
-        # 3. Update Ball Buffer & Ghost Filter
-        active_ball_ids = [t["id"] for t in getattr(ball_tracker, "tracks", {}).values() if not t.get("is_dead")]
-        for bid in active_ball_ids:
-            self.ball_buffer.update(ball_tracker, bid)
-            
-        suppressed_balls = self.ghost_filter.update_and_filter(ball_tracker)
+        player_states = []
+        for pid in pose_data.keys():
+            sample = self.pose_tracker.latest_sample(pid)
+            if sample is None:
+                continue
+            player_states.append({
+                "player_id": pid,
+                "anchor": self.pose_tracker.anchor_now(pid),
+                "walking_detected": self.pose_tracker.is_walking(
+                    pid,
+                    window_frames=max(2, int(self.fps * utils.WALK_WINDOW_SEC)),
+                    wrist_vel_thresh=utils.WALK_WRIST_VEL_PX,
+                    shoulder_vel_thresh=utils.WALK_SHOULDER_VEL_PX,
+                    leg_sign_changes=utils.WALK_LEG_SIGN_CHANGES,
+                ),
+                "left_wrist": sample.get("lw"),
+                "right_wrist": sample.get("rw"),
+            })
 
-        # 4. Serve Detection Logic (Priority)
-        serve_info = self.serve_tracker.update(
-            frame_idx, self.person_motion, self.pose_tracker, 
-            self.ball_buffer, ball_tracker, active_pids
-        )
-        output["serve_state"] = serve_info["state"]
-        output["server_id"] = serve_info["server_id"]
-
-        # Check for serve execution trigger
-        if serve_info["state"] == "READY":
-            if self.serve_tracker.check_execution_trigger(self.skeleton_tracker, frame_idx):
-                server_id = self.serve_tracker.server_id
-                anchor = self.pose_tracker._get_torso_center(self.pose_tracker, server_id) or \
-                         next((t["center"] for t in self.person_tracker.tracks if t["id"] == server_id), None)
-                if anchor:
-                    # Feed directly into shot candidate tracker with serve_context=True
-                    self.shot_tracker.add_candidate(
-                        player_id=server_id, frame_idx=frame_idx, anchor=anchor,
-                        ball_id=None, wrists_close=False, serve_context=True, start_dist=None
-                    )
-                self.serve_tracker.reset()
-
-        # 5. Regular Shot Candidate Detection (Non-Serve)
-        if serve_info["state"] == "IDLE":
-            for pid in active_pids:
-                if self.skeleton_tracker.has_swing_recent(pid, window=3):
-                    # Avoid duplicate candidates
-                    if pid not in self.shot_tracker.candidates:
-                        anchor = next((t["center"] for t in self.person_tracker.tracks if t["id"] == pid), None)
-                        if anchor:
-                            lw = self.pose_tracker.history[pid][-1].get("lw")
-                            rw = self.pose_tracker.history[pid][-1].get("rw")
-                            wrists_close = (lw and rw and math.hypot(lw[0]-rw[0], lw[1]-rw[1]) < 60.0)
-                            self.shot_tracker.add_candidate(
-                                player_id=pid, frame_idx=frame_idx, anchor=anchor,
-                                ball_id=None, wrists_close=wrists_close, serve_context=False, start_dist=None,
-                                lw=lw, rw=rw
-                            )
-
-        # 6. Update Wrist Re-validation & Shot Confirmation
-        anchors_map = {t["id"]: t["center"] for t in self.person_tracker.tracks}
-        for pid in self.shot_tracker.candidates:
-            if pid in pose_data:
-                lw = self.pose_tracker.history[pid][-1].get("lw")
-                rw = self.pose_tracker.history[pid][-1].get("rw")
-                # Mock confidence extraction; replace with actual pose model confidences
-                self.shot_tracker.update_wrists(pid, lw, rw, lw_conf=0.8, rw_conf=0.8)
-
-        confirmed = self.shot_tracker.update(
-            frame_idx, ball_tracker, anchors_map, 
-            suppressed_ball_ids=suppressed_balls, disappearance_buffer=self.ball_buffer
-        )
-        
+        confirmed = self.shot_engine.process_frame(frame_idx, player_states, self.pose_tracker, ball_tracker)
         for shot in confirmed:
-            shot["frame"] = frame_idx
-            shot["status"] = "pending_return"
             self.shots_log.append(shot)
             output["confirmed_shots"].append(shot)
-            
-            # Register for missed/return detection
-            ball_id = shot.get("ball_id")
-            if ball_id:
-                track = ball_tracker.get_track(ball_id)
-                init_dir = utils.compute_ball_direction(track)
-                self.missed_detector.register_shot(len(self.shots_log)-1, frame_idx, ball_id, init_dir)
-
-        # 7. Missed/Return Detection
-        self.missed_detector.update(frame_idx, ball_tracker, self.shots_log)
 
         output["total_shots"] = len(self.shots_log)
-        output["debug"]["suppressed_balls"] = list(suppressed_balls)
-        output["debug"]["active_candidates"] = list(self.shot_tracker.candidates.keys())
+        output["debug"]["active_candidates"] = list(self.shot_engine.candidates.candidates.keys())
         return output
