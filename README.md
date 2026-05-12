@@ -15,10 +15,8 @@ A computer vision system that detects tennis players, tracks ball movement, esti
    - [Task 3: Pose Estimation](#task-3-pose-estimation)
    - [Task 4: Shot Detection](#task-4-shot-detection)
    - [Task 5: Motion & Movement Analysis](#task-5-motion--movement-analysis)
-5. [Processing Pipeline](#processing-pipeline)
-6. [Output Format](#output-format)
-7. [Key Concepts](#key-concepts)
-8. [Configuration](#configuration)
+5. [Key Concepts](#key-concepts)
+6. [Configuration](#configuration)
 
 ---
 
@@ -241,64 +239,7 @@ All shots require:
 
 ---
 
-## Processing Pipeline
 
-### Frame-by-Frame Processing
-
-For each frame in the video:
-
-```python
-# Step 1: Run YOLO models
-persons = detect_persons(frame)          # YOLOv8 detector
-balls = detect_balls(frame)              # Ball-specific YOLOv8
-poses = detect_poses(persons, frame)     # YOLOv8-Pose
-
-# Step 2: Update trackers
-ball_tracker.update(balls, frame_index)  # Track ball across frames
-person_tracker.update(persons)           # Track people across frames
-
-# Step 3: Process each player
-for person in persons:
-    player_data = analyze_player(person, poses, ball_tracker)
-    
-# Step 4: Detect shots
-shot_events = shot_engine.process_frame(
-    frame_index, player_data, pose_history, ball_tracker
-)
-
-# Step 5: Draw and save
-draw_annotations(frame, persons, shots, ball_tracker)
-output_video.write(frame)
-```
-
-### Output Generation
-
-After processing all frames:
-- **shots.jsonl** - One JSON object per line, each containing detected shot data
-- **output_video.mp4** - Annotated video with boxes, IDs, shot labels
-
----
-
-## Output Format
-
-The `shots.jsonl` file contains one shot per line:
-
-```json
-{
-  "player_id": 1,
-  "frame": 453,
-  "second": 15.1,
-  "shot": "forehand"
-}
-```
-
-**Fields:**
-- `player_id`: Unique identifier for the player (assigned by PersonTracker)
-- `frame`: Frame number where shot occurred (0-indexed)
-- `second`: Time in seconds from video start
-- `shot`: Type of shot - "forehand", "backhand", or "serve"
-
----
 
 ## Key Concepts
 
