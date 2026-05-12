@@ -14,7 +14,6 @@ def record_shot_event(
         "frame": int(frame_idx),
         "second": round(frame_idx / float(fps), 3) if fps else 0.0,
         "shot": shot_info.get("shot"),
-        "ball_speed_ms": utils.safe_float(shot_info.get("ball_speed_ms"))
     }
     shots.append(shot_entry)
     shot_idx = len(shots) - 1

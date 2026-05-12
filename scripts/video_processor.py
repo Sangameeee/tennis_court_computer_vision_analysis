@@ -137,6 +137,5 @@ class VideoProcessor:
                     "frame": utils.safe_int(s.get("frame")),
                     "second": utils.safe_float(s.get("second")),
                     "shot": s.get("shot"),
-                    "ball_speed_ms": utils.safe_float(s.get("ball_speed_ms")),
                 }) + "\n")
         print(f"Done. Saved to: {output_video_path} and {shots_path}")
